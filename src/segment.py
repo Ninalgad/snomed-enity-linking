@@ -1,14 +1,10 @@
 import pandas as pd
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
 import torch
-from transformers import AutoModelForTokenClassification
 import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModelForTokenClassification
 
 from utils import *
-
-
-SEG_MODEL = 'dmis-lab/biosyn-biobert-bc5cdr-disease'
 
 
 class TestDataset(torch.utils.data.Dataset):
@@ -23,7 +19,7 @@ class TestDataset(torch.utils.data.Dataset):
         return len(self.encodings)
 
 
-def predict(inp, model, device, batch_size=8):
+def predict_segmentation(inp, model, device, batch_size=8):
     test_loader = DataLoader(TestDataset(inp),
                              batch_size=batch_size, shuffle=False)
     predictions = []
@@ -35,72 +31,107 @@ def predict(inp, model, device, batch_size=8):
     return np.concatenate(predictions, axis=0)
 
 
-def is_overlap(existing_spans, new_span):
-    for span in existing_spans:
-        # Check if either end of the new span is within an existing span
-        if (span[0] <= new_span[0] <= span[1]) or \
-           (span[0] <= new_span[1] <= span[1]):
-            return True
-        # Check if the new span entirely covers an existing span
-        if new_span[0] <= span[0] and new_span[1] >= span[1]:
-            return True
-    return False
+def create_data(text, tokenizer, seq_len=512):
+    tokens = tokenizer(text, add_special_tokens=False)
+    _token_batches = {k: [padd_seq(x, seq_len) for x in batch_list(v, seq_len)]
+                      for (k, v) in tokens.items()}
+    n_batches = len(_token_batches['input_ids'])
+    return [{k: v[i] for k, v in _token_batches.items()}
+            for i in range(n_batches)]
 
 
-def segment(notes):
+def segment_tokens(notes, model, tokenizer, device, batch_size=8):
+    predictions = {}
+    for note in notes.itertuples():
+        raw_text = note.text.lower()
+
+        inp = create_data(raw_text, tokenizer)
+        pred_probs = predict_segmentation(inp, model, device, batch_size=batch_size)
+        pred_probs = np.squeeze(pred_probs, -1)
+        pred_probs = np.concatenate(pred_probs)
+
+        predictions[note] = pred_probs
+
+    return predictions
+
+
+def segment(notes, thresh, predictions_prob_map=None, batch_size=8):
     model = AutoModelForTokenClassification.from_pretrained('assets/biobert', num_labels=1)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     _ = model.to(device)
-
     tokenizer = AutoTokenizer.from_pretrained('assets/biobert-tokenizer')
 
-    thresh = 0.20603015075376885
-
     predictions = []
+
+    if predictions_prob_map is None:
+        predictions_prob_map = segment_tokens(notes, model, tokenizer, device, batch_size)
+
+    period_token = tokenizer.encode(".", add_special_tokens=False).pop()
+
     for note in notes.itertuples():
-        note_predictions = {'note_id': [], 'start': [], 'end': [], 'concept': [], 'scores': []}
+        note_predictions = {'note_id': [], 'start': [], 'end': [], 'entity': []}
 
         note_id = note.note_id
-        raw_text = note.text
+        raw_text = note.text.lower()
 
-        inp = create_data(preprocess_text(raw_text), tokenizer)
-        pred_probs = predict(inp, model, device, batch_size=8)
-        pred_probs = np.squeeze(pred_probs, -1)
+        raw_tokens = tokenizer.encode(raw_text, add_special_tokens=False)
+        raw_tokens = np.array(raw_tokens, 'uint32')
+
+        pred_probs = predictions_prob_map[note][:len(raw_tokens)]
         pred = (pred_probs > thresh).astype('uint8')
 
-        named_ents = set()
-        seen_spans = set()
-        for p, x, q in zip(pred, inp, pred_probs):
+        sentences = split_str_with_delim(raw_text, ".")
+        tok_sentence = split_arr_with_delim(raw_tokens, period_token)
+        pred_sentence = []
+        pointer = 0
+        for s in tok_sentence:
+            n = len(s)
+            pred_sentence.append(pred[pointer:pointer + n])
+            pointer += n
 
-            # get entity strings
-            tokens = np.array(x['input_ids'], 'uint32')
-            token_spans = get_sequential_spans(p)
-            entity_tokens = [tokens[s] for s in token_spans]
-            entity_scores = [q[s].mean() for s in token_spans]
+        pointer = 0
+        for (sen, pred_sen, tok_sen) in zip(sentences, pred_sentence, tok_sentence):
+            if pred_sen.max() == 0:
+                pointer += len(sen)
+                continue
 
-            # convert to strings
-            pred_ent = [tokenizer.decode(t) for t in entity_tokens]
+            tok_sen = np.array(tok_sen, 'uint32')
+            # get predicted entities
+            spans = get_sequential_spans(pred_sen)
+            tok_ent = [tok_sen[s] for s in spans]
+            pred_ent = [tokenizer.decode(t) for t in tok_ent]
 
-            # search for all occurences of each ent
-            for ent, score in zip(pred_ent, entity_scores):
-                # filter predicted ent strings (e.g. single char, article, ..)
-                if (ent not in named_ents) and (len(ent) > 2):
+            seen_spans = set()
+            for ent in pred_ent:
+                if ent not in sen:
+                    # if no exact reverse token mapping:
+                    # get best approx using substrings of same word length
+                    ent = best_matching_substring(sen, ent)
 
-                    for s, e in find_all_substrings(ent.lower(), raw_text.lower()):
+                try:
+                    # get first
+                    s = sen.index(ent)
+                    e = s + len(ent)
+                except ValueError:
+                    s = 0
+                    e = len(ent) - 1
+                    ent = sen
 
-                        if not is_overlap(seen_spans, (s, e)):
+                span = (s + pointer, e + pointer)
 
-                            note_predictions['note_id'].append(note_id)
-                            note_predictions['start'].append(s)
-                            note_predictions['end'].append(e)
-                            note_predictions['concept'].append(ent)
-                            note_predictions['scores'].append(score)
-                            named_ents.add(ent)
-                            seen_spans.add((s, e))
+                # assert sen[s:e] == raw_text[span[0]: span[1]], (ent, sen[s:e], raw_text[span[0]: span[1]])
+
+                if not is_overlap(seen_spans, span):
+                    note_predictions['note_id'].append(note_id)
+                    note_predictions['start'].append(span[0])
+                    note_predictions['end'].append(span[1])
+                    note_predictions['entity'].append(sen[s:e])
+                    seen_spans.add(span)
+
+            pointer += len(sen)
+            # print(pointer, len(raw_text))
 
         note_predictions = pd.DataFrame(note_predictions)
-        note_predictions = note_predictions.sort_values('scores', ascending=False).iloc[:1000]
-
         predictions.append(note_predictions)
 
     predictions = pd.concat(predictions).reset_index(drop=True)

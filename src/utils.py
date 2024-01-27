@@ -1,71 +1,42 @@
 import numpy as np
+from difflib import SequenceMatcher
 
 
-def create_data(text, tokenizer, entities=None, max_blocks=8):
-    has_labels = entities is not None
-    inp, tar = [], []
-    embeddings = tokenizer(text, padding="max_length", truncation=True,
-                           max_length=max_blocks * 512)
-
-    for i in range(max_blocks):
-        x = {k: v[i * 512: (i + 1) * 512] for (k, v) in embeddings.items()}
-
-        if x['input_ids'][0] == tokenizer.pad_token_id:
-            break
-
-        if has_labels:
-            y = get_seg_label(entities, x['input_ids'], tokenizer)
-        else:
-            y = np.ones(1, 'uint8')
-
-        if y.sum() != 0:
-            inp.append(x)
-            tar.append(y)
-
-    if has_labels:
-        return inp, tar
-    return inp
+def similar(a, b):
+    return SequenceMatcher(None, a, b).ratio()
 
 
-def tokenize_entities(entities, tokenizer):
-    results = []
-    for e in entities:
-        ent_tok = tokenizer.encode(e)[1:-1]
-        results.append(ent_tok)
+def best_matching_substring(context, target):
+    target = target.strip()
+    sub_tok = target.split(" ")
+    n = len(sub_tok)
+    tok = context.split(" ")
 
-    return results
+    best_score, best_sub = 0, " ".join(target[:n])
+    for i in range(len(tok) - n + 1):
+        proposal = " ".join(tok[i:i + n])
 
+        s = similar(proposal, target)
+        if s > best_score:
+            best_score = s
+            best_sub = proposal
 
-def get_seg_label(entities, tokens, tokenizer):
-    n_tokens = len(tokens)
-    label = np.zeros(n_tokens, 'uint8')
-    ent_tokens = tokenize_entities(entities, tokenizer)
-
-    for e in ent_tokens:
-        n = len(e)
-
-        for i in range(n, n_tokens - n):
-            if tokens[i: i + n] == e:
-                label[i: i + n] = 1
-
-    return label
+    return best_sub
 
 
-def preprocess_text(t):
-    i = t.index('Sex:')
-    t = t[i:]
-    # t = t[400:]
-    # t = t.split(' ')[1:]
-    # t = " ".join(t)
+def split_str_with_delim(text, d):
+    return [e + d for e in text.split(d) if e]
 
-    t = t.replace('\n \nAttending: ___.\n \n', '\n\n')
-    t = t.replace('___', '_')
-    t = t.replace('\n \n', ' \n ')
-    t = t.replace(' \n', ' \n ')
-    t = t.replace('  ', ' ')
 
-    t = t.lower()
-    return t
+def split_arr_with_delim(a, d):
+    seqences = []
+    cur = []
+    for x in a:
+        cur.append(x)
+        if x == d:
+            seqences.append(cur)
+            cur = []
+    return seqences
 
 
 def get_sequential_spans(a):
@@ -90,11 +61,11 @@ def get_sequential_spans(a):
     return spans
 
 
+# https://stackoverflow.com/a/3874760
 def find_all_substrings(sub, string):
-    # https://stackoverflow.com/a/3874760
     """
     >>> text = "Allowed Hello Hollow"
-    >>> tuple(findall('ll', text))
+    >>> tuple(find_all_substrings('ll', text))
     (1, 10, 16)
     """
     index = 0 - len(sub)
@@ -104,3 +75,29 @@ def find_all_substrings(sub, string):
             yield index, index + len(sub)
     except ValueError:
         pass
+
+
+def is_overlap(existing_spans, new_span):
+    for span in existing_spans:
+        # Check if either end of the new span is within an existing span
+        if (span[0] <= new_span[0] <= span[1]) or \
+                (span[0] <= new_span[1] <= span[1]):
+            return True
+        # Check if the new span entirely covers an existing span
+        if new_span[0] <= span[0] and new_span[1] >= span[1]:
+            return True
+    return False
+
+
+def batch_list(iterable, n=1):
+    l = len(iterable)
+    for ndx in range(0, l, n):
+        yield iterable[ndx:min(ndx + n, l)]
+
+
+def padd_seq(seq, max_len):
+    n = len(seq)
+    if n >= max_len:
+        return seq
+    else:
+        return np.pad(seq, (0, max_len - n))
