@@ -55,12 +55,7 @@ def segment_tokens(notes, model, tokenizer, device, batch_size=8):
     return predictions
 
 
-def segment(notes, thresh, predictions_prob_map=None, batch_size=8):
-    model = AutoModelForTokenClassification.from_pretrained('assets/biobert', num_labels=1)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    _ = model.to(device)
-    tokenizer = AutoTokenizer.from_pretrained('assets/biobert-tokenizer')
-
+def segment(notes, thresh, model, tokenizer, device, predictions_prob_map=None, batch_size=8):
     predictions = []
 
     if predictions_prob_map is None:
@@ -108,14 +103,17 @@ def segment(notes, thresh, predictions_prob_map=None, batch_size=8):
                     # get best approx using substrings of same word length
                     ent = best_matching_substring(sen, ent)
 
-                try:
+                if ent not in sen:
+                    s = 0
+                    e = len(ent) - 1
+                else:
                     # get first
                     s = sen.index(ent)
                     e = s + len(ent)
-                except ValueError:
+
+                if (e - s) <= 1:
                     s = 0
                     e = len(ent) - 1
-                    ent = sen
 
                 span = (s + pointer, e + pointer)
 
