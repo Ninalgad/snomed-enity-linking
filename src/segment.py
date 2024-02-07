@@ -2,7 +2,6 @@ import pandas as pd
 from torch.utils.data import DataLoader
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModelForTokenClassification
 
 from utils import *
 
@@ -20,8 +19,7 @@ class TestDataset(torch.utils.data.Dataset):
 
 
 def predict_segmentation(inp, model, device, batch_size=8):
-    test_loader = DataLoader(TestDataset(inp),
-                             batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(TestDataset(inp), batch_size=batch_size, shuffle=False)
     predictions = []
     for batch in test_loader:
         batch = {k: v.to(device) for k, v in batch.items()}
@@ -40,7 +38,7 @@ def create_data(text, tokenizer, seq_len=512):
             for i in range(n_batches)]
 
 
-def segment_tokens(notes, model, tokenizer, device, batch_size=8):
+def segment_tokens(notes, thresh, model, tokenizer, device, batch_size=8):
     predictions = {}
     for note in notes.itertuples():
         raw_text = note.text.lower()
@@ -49,22 +47,19 @@ def segment_tokens(notes, model, tokenizer, device, batch_size=8):
         pred_probs = predict_segmentation(inp, model, device, batch_size=batch_size)
         pred_probs = np.squeeze(pred_probs, -1)
         pred_probs = np.concatenate(pred_probs)
+        pred = (pred_probs > thresh).astype('uint8')
 
-        predictions[note] = pred_probs
+        predictions[note.note_id] = pred
 
     return predictions
 
 
-def segment(notes, thresh, model, tokenizer, device, predictions_prob_map=None, batch_size=8):
+def segment(notes, prediction_map, tokenizer):
     predictions = []
-
-    if predictions_prob_map is None:
-        predictions_prob_map = segment_tokens(notes, model, tokenizer, device, batch_size)
-
     period_token = tokenizer.encode(".", add_special_tokens=False).pop()
 
     for note in notes.itertuples():
-        note_predictions = {'note_id': [], 'start': [], 'end': [], 'entity': []}
+        note_predictions = {'note_id': [], 'start': [], 'end': [], 'text': []}
 
         note_id = note.note_id
         raw_text = note.text.lower()
@@ -72,8 +67,7 @@ def segment(notes, thresh, model, tokenizer, device, predictions_prob_map=None, 
         raw_tokens = tokenizer.encode(raw_text, add_special_tokens=False)
         raw_tokens = np.array(raw_tokens, 'uint32')
 
-        pred_probs = predictions_prob_map[note][:len(raw_tokens)]
-        pred = (pred_probs > thresh).astype('uint8')
+        pred = prediction_map[note_id][:len(raw_tokens)]
 
         sentences = split_str_with_delim(raw_text, ".")
         tok_sentence = split_arr_with_delim(raw_tokens, period_token)
@@ -123,7 +117,7 @@ def segment(notes, thresh, model, tokenizer, device, predictions_prob_map=None, 
                     note_predictions['note_id'].append(note_id)
                     note_predictions['start'].append(span[0])
                     note_predictions['end'].append(span[1])
-                    note_predictions['entity'].append(sen[s:e])
+                    note_predictions['text'].append(note.text)
                     seen_spans.add(span)
 
             pointer += len(sen)
